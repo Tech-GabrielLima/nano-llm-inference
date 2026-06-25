@@ -1,0 +1,19 @@
+# Model weights (large; download with scripts/download_model.py)
+models/
+*.safetensors
+*.bin
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# NOTE: results/*.png and *.csv ARE committed — real measured benchmark/quality
+# numbers that serve as portfolio artifacts.

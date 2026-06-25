@@ -1,0 +1,12 @@
+# Core engine (CPU): NumPy + safetensors (to read the weights).
+numpy>=1.24
+safetensors>=0.4
+
+# Optional, for the GPU fused kernels (needs an NVIDIA GPU):
+# triton>=2.1
+# torch>=2.0          # Triton kernels operate on torch CUDA tensors
+
+# Optional, for plots / baseline correctness check:
+# matplotlib>=3.5
+# transformers>=4.30  # only scripts/compare_baseline.py uses it (reference logits)
+# regex               # exact GPT-2 pre-tokenization (a re-based fallback is built in)
