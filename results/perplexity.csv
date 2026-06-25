@@ -1,0 +1,4 @@
+precision,perplexity,mem_mb,compression
+fp32,18.0580,497.8,1.000
+int8,18.1272,243.3,2.046
+int4,31.3808,200.8,2.479
