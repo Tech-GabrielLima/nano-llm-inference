@@ -21,7 +21,7 @@ The future of AI is uncertain. The future of AI is uncertain. ...
 
 ---
 
-## Resultados (reais, medidos na CPU neste repo)
+## Resultados (CPU — o motor NumPy)
 
 GPT-2 124M, `scripts/benchmark.py` + `scripts/eval_perplexity.py`:
 
@@ -38,10 +38,44 @@ GPT-2 124M, `scripts/benchmark.py` + `scripts/eval_perplexity.py`:
 
 > O destaque: o **INT8 corta o modelo pela metade sem praticamente perder
 > qualidade**, e o **KV-cache dá 3.9× de speedup no decode** — as duas
-> otimizações que mais importam para servir modelos. Os números são da CPU desta
-> máquina; os **kernels Triton de GPU** estão escritos e validados
-> algoritmicamente, mas rodam em hardware real (esta máquina não tem GPU — ver
-> *Nota de honestidade*).
+> otimizações que mais importam para servir modelos. Estes números são do motor
+> NumPy na CPU; os **kernels Triton de GPU são medidos à parte numa Tesla T4** —
+> ver *Resultados de GPU* abaixo.
+
+---
+
+## Resultados de GPU (kernels Triton, medidos numa Tesla T4 / Kaggle)
+
+O `bench_gpu.py` exercita os dois kernels fundidos numa GPU de verdade: confere
+cada um contra uma referência em PyTorch e então cronometra contra baselines. Os
+kernels **compilam, rodam e estão numericamente corretos** em hardware real.
+
+**FlashAttention (fundido, causal), fp32 — dimensões do GPT-2 124M (12 heads, head_dim 64):**
+
+| seq len | triton (fundido) | PyTorch naive | torch SDPA | correção |
+|--------:|-----------------:|--------------:|-----------:|----------|
+| 256  | 0.353 ms | 0.310 ms | 0.210 ms | rel_err 1.2e-7 |
+| 512  | 1.090 ms | 0.927 ms | 0.452 ms | rel_err 1.4e-7 |
+| 1024 | 2.243 ms | 2.615 ms (**1.2× mais lento que o triton**) | 0.679 ms | rel_err 1.5e-7 |
+
+**Dequant-matmul INT8 (fundido, GEMM da MLP 768→3072), ativações fp32:**
+
+| M | triton (fundido) | dequant+mm sem fundir | fp32 cuBLAS | correção |
+|--:|-----------------:|----------------------:|------------:|----------|
+| 256  | 0.242 ms (**1.5× vs sem fundir**) | 0.366 ms | 0.272 ms | exato |
+| 512  | 0.719 ms | 0.627 ms | 0.532 ms | exato |
+| 1024 | 1.342 ms | 1.167 ms | 1.091 ms | rel_err 4.7e-7 |
+
+Memória de peso: **fp32 → int8 é 4.0× menor**, mantido como int8 no caminho fundido.
+
+> **Leitura honesta:** os kernels estão corretos em hardware real, e o caminho
+> INT8 é um ganho de memória genuíno (4×). Em velocidade bruta eles são
+> competitivos com os baselines naive, mas **não** batem o SDPA / cuBLAS do
+> torch — que usam **Tensor Cores** em fp16, autotuning e pipelining de software
+> que estes kernels feitos à mão em **fp32** ainda não têm (a T4 é sm_75; `tl.dot`
+> em fp32 não aciona os tensor cores). Números reportados como medidos — vitórias
+> e derrotas. Fechar essa lacuna (fp16 + autotune) é o primeiro item em *Próximos
+> passos*.
 
 ---
 
@@ -53,9 +87,9 @@ GPT-2 124M, `scripts/benchmark.py` + `scripts/eval_perplexity.py`:
 | Tokenizer BPE do GPT-2 do zero | [`tokenizer.py`](nanollm/tokenizer.py) | ✅ bate com ids canônicos |
 | Forward do GPT-2 (NumPy), gera texto coerente | [`model.py`](nanollm/model.py) | ✅ roda |
 | **KV-cache** no decode autoregressivo | [`model.py`](nanollm/model.py) | ✅ 3.9× |
-| Atenção fundida **estilo FlashAttention** | [`attention.py`](nanollm/attention.py) (NumPy) · [`triton_kernels.py`](nanollm/triton_kernels.py) (GPU) | ✅ NumPy validado · 🟡 Triton = GPU |
+| Atenção fundida **estilo FlashAttention** | [`attention.py`](nanollm/attention.py) (NumPy) · [`triton_kernels.py`](nanollm/triton_kernels.py) (GPU) | ✅ NumPy validado · ✅ Triton roda & correto na T4 |
 | Quantização de pesos **INT8/INT4** | [`quant.py`](nanollm/quant.py) | ✅ roda |
-| Kernel **dequant-matmul fundido** | [`triton_kernels.py`](nanollm/triton_kernels.py) | 🟡 GPU |
+| Kernel **dequant-matmul fundido** | [`triton_kernels.py`](nanollm/triton_kernels.py) | ✅ roda & correto na T4 (4× mem de peso) |
 | **Batching estático** (left-pad + máscara) | [`generate.py`](nanollm/generate.py) | ✅ roda |
 | Sampling (greedy / temperatura / top-k) | [`generate.py`](nanollm/generate.py) | ✅ roda |
 | Métricas: tok/s, latência, memória, perplexidade | [`metrics.py`](nanollm/metrics.py), `scripts/` | ✅ roda |
@@ -78,6 +112,9 @@ python scripts/benchmark.py                  # tok/s, latência, memória  -> re
 python scripts/eval_perplexity.py            # qualidade vs quantização  -> results/perplexity.csv
 python scripts/plot_results.py               # -> results/*.png
 python scripts/compare_baseline.py           # vs logits do HuggingFace (se transformers instalado)
+
+# Só GPU (precisa de GPU NVIDIA + torch + triton):
+python bench_gpu.py                          # kernels Triton: correção + timings vs PyTorch
 ```
 
 ---
@@ -100,13 +137,15 @@ nanollm/
 O modelo carrega os pesos como um `dict` de arrays NumPy; a quantização troca os
 pesos lineares grandes por `QTensor`s, e o `_mm` do modelo despacha de forma
 transparente (`x @ W` vs `qtensor.matmul(x)`). O backend de atenção é um switch de
-uma linha (`attn_impl="naive"|"flash"`). É assim que o mesmo motor mira CPU e GPU.
+uma linha (`attn_impl="naive"|"flash"`). Os kernels Triton em `triton_kernels.py`
+são o caminho de GPU; o motor NumPy e os kernels de GPU compartilham a mesma
+matemática, validada entre si na CPU e contra o PyTorch na GPU.
 
 ---
 
 ## Correção — como sabemos que está certo
 
-`python tests/test_nanollm.py`:
+`python tests/test_nanollm.py` (CPU):
 
 ```
 [PASS] tokenizer roundtrip / ids canônicos       ( " the" -> [262], "Hello" -> [15496] )
@@ -117,35 +156,47 @@ uma linha (`attn_impl="naive"|"flash"`). É assim que o mesmo motor mira CPU e G
 [PASS] batch estático == solo  (idêntico por linha)
 ```
 
+O `python bench_gpu.py` (GPU) confirma adicionalmente que os **kernels Triton**
+batem com uma referência em PyTorch numa Tesla T4: FlashAttention com
+`rel_err ~1e-7` vs `F.scaled_dot_product_attention`, e o dequant-matmul INT8 exato
+vs `(x @ Wq.float()) * scale`.
+
 E o `scripts/compare_baseline.py` confere os logits do nanollm contra o **GPT-2 do
 HuggingFace** (se `transformers` estiver instalado) — batem até o arredondamento
 de float32, confirmando que o forward feito do zero é o GPT-2 de verdade.
 
 ---
 
-## Nota de honestidade (GPU / Triton)
+## Nota de honestidade (o que rodou onde)
 
-Esta máquina **não tem GPU NVIDIA**, e o interpretador de CPU do Triton 2.1 não
-funciona aqui, então:
-- tudo na coluna **"✅ roda"** acima é real e foi executado aqui (GPT-2 real,
-  texto real, tok/s real, perplexidade real);
-- os **kernels Triton** (`triton_kernels.py`) são o caminho de GPU — escritos para
-  compilar e rodar em GPU NVIDIA, com os *algoritmos* validados na CPU pelos
-  equivalentes em NumPy (`flash == naive`, round-trip da quant). Eles não são
-  executados nas rodadas deste repo.
+O desenvolvimento foi feito numa máquina **só com CPU**, então os números do motor
+NumPy acima (KV-cache, batching estático, perplexidade/memória da quantização) são
+medições de CPU.
 
-Não apresento números de GPU que não medi.
+Os **kernels Triton de GPU** (`triton_kernels.py`) foram depois executados numa
+**Tesla T4** (Kaggle) via `bench_gpu.py`: eles compilam, rodam e batem com a
+referência em PyTorch (atenção `rel_err ~1e-7`; dequant-matmul INT8 exato) — a
+seção *Resultados de GPU* reporta os timings medidos. Em velocidade bruta esses
+kernels feitos à mão em **fp32** são competitivos com os baselines naive, mas
+**não** batem o SDPA / cuBLAS do torch, que usam Tensor Cores em fp16 e autotuning
+que os kernels ainda não têm. Todo número aqui é reportado exatamente como medido,
+incluindo vitórias e derrotas. Não apresento números de GPU que não medi.
 
 ## Baselines & próximos passos
 
-- **Baseline de correção:** GPT-2 do HuggingFace `transformers` (match de logits) —
-  `scripts/compare_baseline.py`.
-- **Baselines de performance** (GPU, documentados, não rodados aqui): `llama.cpp`
-  (`llama-bench`) e `vLLM` (`api_server`) — as referências de produção que estas
-  otimizações almejam.
-- **Próximos passos:** continuous batching + KV-cache paginado (PagedAttention),
-  quantizar também a embedding de tokens (leva o INT8 de ~2× para ~4×), GQA/RoPE
-  para suportar Llama, e ativações fp16/bf16.
+- **Baselines de correção:** GPT-2 do HuggingFace `transformers` (match de logits,
+  `scripts/compare_baseline.py`); `F.scaled_dot_product_attention` do PyTorch e
+  cuBLAS na GPU (`bench_gpu.py`).
+- **Baselines de performance** (referências de produção que as otimizações
+  almejam): `llama.cpp` (`llama-bench`) e `vLLM` (`api_server`).
+- **Próximos passos:**
+  - **`tl.dot` em fp16 + `@triton.autotune`** para que os kernels usem os Tensor
+    Cores da T4 e blocos ajustados — o caminho direto para fechar a lacuna até
+    SDPA/cuBLAS.
+  - continuous batching + KV-cache paginado (PagedAttention),
+  - quantizar também a embedding de tokens (leva o INT8 de ~2× para ~4×
+    ponta-a-ponta),
+  - GQA/RoPE para suportar Llama, e ativações fp16/bf16.
 
 ---
 
